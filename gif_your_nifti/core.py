@@ -3,9 +3,15 @@
 import os
 import nibabel as nb
 import numpy as np
+from enum import Enum
 from matplotlib.cm import get_cmap
 from imageio import mimwrite
 from skimage.transform import resize
+
+class Orient(Enum):
+    SAGITTAL = 0
+    CORONAL = 1
+    TRANSVERSE = 2
 
 
 def parse_filename(filepath):
@@ -19,7 +25,7 @@ def parse_filename(filepath):
     Returns
     -------
     dirname: str
-        File directory.
+        File directory.[
     basename: str
         File name without directory and extension.
     ext: str
@@ -33,7 +39,7 @@ def parse_filename(filepath):
     return dirname, basename, ext
 
 
-def load_and_prepare_image(filename, size=1):
+def load_and_prepare_image(filename, size=1, slice_orient=None):
     """Load and prepare image data.
 
     Parameters
@@ -42,60 +48,103 @@ def load_and_prepare_image(filename, size=1):
         Input file (eg. /john/home/image.nii.gz)
     size: float
         Image resizing factor.
+    slice_orient: str
+        Output slice orientation (must be valid value of Orient enum)
 
     Returns
     -------
     out_img: numpy array
 
     """
-    # Load NIfTI file
+    # Load image file
     data = nb.load(filename).get_data()
 
-    # Pad data array with zeros to make the shape isometric
-    maximum = np.max(data.shape)
+    if slice_orient and slice_orient not in Orient.__members__:
+        raise ValueError('Slice orientation must be one of: {}'.format(', '.join(Orient.__members__)))
+    if data.ndim == 4:
+        # if data.shape[3] != 1:
+        if not slice_orient:
+            raise ValueError('Slice orientation must be specified when creating gifs of 4D images')
 
-    out_img = np.zeros([maximum] * 3)
+        orientation = Orient[slice_orient.upper()].value
+        center_slice = data.shape[orientation] // 2
+        out_img = np.take(data, center_slice, axis=orientation)
+        maximum = np.max(out_img.shape)
+        resize_shape = [ dim * size for dim in out_img.shape[:2] ] + [ out_img.shape[2] ] # don't resize number of frames
+        # handle data formats that store 3D images as a single frame 4D image
+        # else:
+        #     data = np.reshape(data, data.shape[:3]) # remove 4th dimension
 
-    a, b, c = data.shape
-    x, y, z = (list(data.shape) - maximum) / -2
+    if data.ndim == 3:
+        maximum = np.max(data.shape)
+        resize_shape = [ int(maximum * size) ] * 3
 
-    out_img[int(x):a + int(x),
-            int(y):b + int(y),
-            int(z):c + int(z)] = data
+        # Pad data array with zeros to make the shape isometric
+        out_img = np.zeros([maximum] * 3)
 
-    out_img /= out_img.max()  # scale image values between 0-1
+        a, b, c = data.shape
+        x, y, z = (list(data.shape) - maximum) / -2
+
+        out_img[int(x):a + int(x),
+                int(y):b + int(y),
+                int(z):c + int(z)] = data
+
+
+    out_img = np.array(out_img) / out_img.max()  # scale image values between 0-1
 
     # Resize image by the following factor
     if size != 1:
-        out_img = resize(out_img, [int(size * maximum)] * 3)
+        out_img = resize(out_img, resize_shape)
 
     maximum = int(maximum * size)
 
+    out_img = (255 * out_img).astype(np.uint8)
     return out_img, maximum
 
 
-def create_mosaic_normal(out_img, maximum):
+def get_orient_slice(out_img, maximum, i, orient=Orient.TRANSVERSE):
+    if orient == Orient.SAGITTAL:
+        return np.flip(out_img[i, :, :], 1).T
+    elif orient == Orient.CORONAL:
+        return np.flip(out_img[:, maximum - i - 1, :], 1).T
+    elif orient == Orient.TRANSVERSE:
+        return np.flip(out_img[:, :, maximum - i - 1], 1).T
+
+
+def create_mosaic_normal(out_img, maximum, slice_orient):
     """Create grayscale image.
 
     Parameters
     ----------
     out_img: numpy array
     maximum: int
+    slice_orient: string
 
     Returns
     -------
     new_img: numpy array
 
     """
-    new_img = np.array(
-        [np.hstack((
-            np.hstack((
-                np.flip(out_img[i, :, :], 1).T,
-                np.flip(out_img[:, maximum - i - 1, :], 1).T)),
-            np.flip(out_img[:, :, maximum - i - 1], 1).T))
-         for i in range(maximum)])
+    if not slice_orient:
+        new_img = \
+            [np.hstack((
+                np.hstack((
+                    get_orient_slice(out_img, maximum, i, Orient.SAGITTAL),
+                    get_orient_slice(out_img, maximum, i, Orient.CORONAL))),
+                   get_orient_slice(out_img, maximum, i, Orient.TRANSVERSE)))
+             for i in range(maximum)]
+    else:
+        orientation = Orient[slice_orient.upper()]
+        orient_max = out_img.shape[orientation.value]
 
-    return new_img
+        # if image is isometric, we'll assume it is not a time series and get all slices for the specified orientation
+        # otherwise, we will get one slice per timepoint --
+        #     the image has already been filtered to the central slice of the specified orientation, so we'll treat
+        #     it as a transverse image and simply iterate over the time points
+        new_img = [ get_orient_slice(out_img, maximum, i, orientation) for i in range(maximum) ] if all(item == maximum for item in out_img.shape) \
+            else [ get_orient_slice(out_img, orient_max, i) for i in range(out_img.shape[-1]) ]
+
+    return np.array(new_img)
 
 
 def create_mosaic_depth(out_img, maximum):
@@ -166,7 +215,8 @@ def create_mosaic_RGB(out_img1, out_img2, out_img3, maximum):
     return out_img
 
 
-def write_gif_normal(filename, size=1, fps=18):
+
+def write_gif_normal(filename, size=1, fps=18, slice_orient=None):
     """Procedure for writing grayscale image.
 
     Parameters
@@ -180,10 +230,11 @@ def write_gif_normal(filename, size=1, fps=18):
 
     """
     # Load NIfTI and put it in right shape
-    out_img, maximum = load_and_prepare_image(filename, size)
+    out_img, maximum = load_and_prepare_image(filename, size, slice_orient)
+
 
     # Create output mosaic
-    new_img = create_mosaic_normal(out_img, maximum)
+    new_img = create_mosaic_normal(out_img, maximum, slice_orient)
 
     # Figure out extension
     ext = '.{}'.format(parse_filename(filename)[2])
@@ -263,7 +314,7 @@ def write_gif_rgb(filename1, filename2, filename3, size=1, fps=18):
     mimwrite(out_path, new_img, format='gif', fps=int(fps * size))
 
 
-def write_gif_pseudocolor(filename, size=1, fps=18, colormap='hot'):
+def write_gif_pseudocolor(filename, size=1, fps=18, colormap='hot', slice_orient=None):
     """Procedure for writing pseudo color image.
 
     The colormap can be any colormap from matplotlib.
@@ -281,10 +332,10 @@ def write_gif_pseudocolor(filename, size=1, fps=18, colormap='hot'):
 
     """
     # Load NIfTI and put it in right shape
-    out_img, maximum = load_and_prepare_image(filename, size)
+    out_img, maximum = load_and_prepare_image(filename, size, slice_orient)
 
     # Create output mosaic
-    new_img = create_mosaic_normal(out_img, maximum)
+    new_img = create_mosaic_normal(out_img, maximum, slice_orient)
 
     # Transform values according to the color map
     cmap = get_cmap(colormap)
